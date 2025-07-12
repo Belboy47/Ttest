@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -15,57 +16,98 @@ import (
 )
 
 var (
-	logger     = utils.NewLogger("info")
-	configPath *string
-	ctx        context.Context
-	cancel     context.CancelFunc
+	logger      = utils.NewLogger("debug") // use "debug" level by default
+	configPath  *string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	errorCount  int32 = 0                   // counts consecutive failures
+	maxErrors   int32 = 3                   // threshold before forced shutdown
+	checkPeriod       = 5 * time.Second     // watchdog check interval
 )
 
-// Define the version of the application
-const version = "v0.6.6"
+const (
+	version = "v0.6.6"
+)
 
 func main() {
+	// CLI flags
 	configPath = flag.String("c", "", "path to the configuration file (TOML format)")
 	showVersion := flag.Bool("v", false, "print the version and exit")
 
 	flag.Parse()
 
-	// If the version flag is provided, print the version and exit
 	if *showVersion {
 		fmt.Println(version)
 		os.Exit(0)
 	}
 
-	// Check if the configPath is provided
 	if *configPath == "" {
 		logger.Fatalf("Usage: %s -c /path/to/config.toml", flag.CommandLine.Name())
 	}
 
-	// Apply temporary TCP optimizations at startup
+	// Apply basic TCP tuning at startup (from cmd package)
 	cmd.ApplyTCPTuning()
 
-	// Create a context for graceful shutdown handling
+	// Context setup
 	ctx, cancel = context.WithCancel(context.Background())
 
-	// Set up signal handling for graceful shutdown
+	// Signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	// Start main runner
 	go cmd.Run(*configPath, ctx)
+
+	// Optional: hot reload on config change
 	go hotReload()
 
+	// New: start watchdog to monitor repeated errors
+	go tunnelErrorWatchdog()
+
+	logger.Info("Backhaul started successfully")
 	<-sigChan
 
 	cancel()
-
+	logger.Info("Shutdown signal received, exiting")
 	time.Sleep(1 * time.Second)
 }
 
+func tunnelErrorWatchdog() {
+	ticker := time.NewTicker(checkPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count := atomic.LoadInt32(&errorCount)
+			if count > 0 {
+				logger.Warnf("Tunnel error count: %d / %d", count, maxErrors)
+			}
+			if count >= maxErrors {
+				logger.Errorf("Too many tunnel failures (>%d), exiting Backhaul to allow supervisor restart", maxErrors)
+				os.Exit(1)
+			}
+		}
+	}
+}
+
+// This should be called from inside tunnel failure paths
+func incrementTunnelError(reason string) {
+	newVal := atomic.AddInt32(&errorCount, 1)
+	logger.Warnf("Tunnel error #%d: %s", newVal, reason)
+}
+
+// Optionally call this on successful tunnel flow to reset counter
+func resetTunnelErrorCounter() {
+	atomic.StoreInt32(&errorCount, 0)
+}
+
 func hotReload() {
-	// Get initial modification time of the config file
 	lastModTime, err := getLastModTime(*configPath)
 	if err != nil {
-		logger.Fatalf("Error getting modification time: %v", err)
+		logger.Fatalf("Error getting config modification time: %v", err)
 	}
 
 	ticker := time.NewTicker(2 * time.Second)
@@ -82,20 +124,15 @@ func hotReload() {
 				continue
 			}
 
-			// If the modification time has changed, reload the app
 			if modTime.After(lastModTime) {
 				logger.Info("Config file changed, reloading application")
 
-				// Cancel the previous context to stop the old running instance
 				cancel()
-
 				time.Sleep(2 * time.Second)
 
-				// Create a new context for the new instance
 				newCtx, newCancel := context.WithCancel(context.Background())
 				go cmd.Run(*configPath, newCtx)
 
-				// Update the last modification time and the context
 				lastModTime = modTime
 				ctx = newCtx
 				cancel = newCancel
