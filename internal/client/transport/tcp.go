@@ -27,6 +27,7 @@ type TcpTransport struct {
 	loadConnections int32
 	controlFlow     chan struct{}
 }
+
 type TcpConfig struct {
 	RemoteAddr     string
 	Token          string
@@ -43,35 +44,26 @@ type TcpConfig struct {
 }
 
 func NewTCPClient(parentCtx context.Context, config *TcpConfig, logger *logrus.Logger) *TcpTransport {
-	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
-
-	// Initialize the TcpTransport struct
-	client := &TcpTransport{
-		config:          config,
-		parentctx:       parentCtx,
-		ctx:             ctx,
-		cancel:          cancel,
-		logger:          logger,
-		controlChannel:  nil, // will be set when a control connection is established
-		usageMonitor:    web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
-		poolConnections: 0,
-		loadConnections: 0,
-		controlFlow:     make(chan struct{}, 100),
+	return &TcpTransport{
+		config:       config,
+		parentctx:    parentCtx,
+		ctx:          ctx,
+		cancel:       cancel,
+		logger:       logger,
+		controlFlow:  make(chan struct{}, 100),
+		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
 	}
-
-	return client
 }
 
 func (c *TcpTransport) Start() {
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
 	}
-
 	c.config.TunnelStatus = "Disconnected (TCP)"
-
 	go c.channelDialer()
 }
+
 func (c *TcpTransport) Restart() {
 	if !c.restartMutex.TryLock() {
 		c.logger.Warn("client is already restarting")
@@ -79,176 +71,171 @@ func (c *TcpTransport) Restart() {
 	}
 	defer c.restartMutex.Unlock()
 
-	c.logger.Info("restarting client...")
-
-	// for removing timeout logs
-	level := c.logger.Level
-	c.logger.SetLevel(logrus.FatalLevel)
-
+	c.logger.Warn("restarting TCP client...")
 	if c.cancel != nil {
 		c.cancel()
 	}
-
-	// close control channel connection
 	if c.controlChannel != nil {
 		c.controlChannel.Close()
 	}
-
-	time.Sleep(2 * time.Second)
+	time.Sleep(1 * time.Second)
 
 	ctx, cancel := context.WithCancel(c.parentctx)
+	*c = *NewTCPClient(c.parentctx, c.config, c.logger)
 	c.ctx = ctx
 	c.cancel = cancel
-
-	// Re-initialize variables
-	c.controlChannel = nil
-	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
-	c.config.TunnelStatus = ""
-	c.poolConnections = 0
-	c.loadConnections = 0
-	c.controlFlow = make(chan struct{}, 100)
-
-	// set the log level again
-	c.logger.SetLevel(level)
-
 	go c.Start()
 }
 
 func (c *TcpTransport) channelDialer() {
-	c.logger.Info("attempting to establish a new control channel connection...")
+	c.logger.Info("attempting to establish control channel...")
 
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
-			//set default behaviour of control channel to nodelay, also using default buffer parameters
-			tunnelTCPConn, err := TcpDialer(c.ctx, c.config.RemoteAddr, c.config.DialTimeOut, c.config.KeepAlive, true, 3, 0, 0)
+			tunnelTCPConn, err := TcpDialer(c.ctx, c.config.RemoteAddr, c.config.DialTimeOut, c.config.KeepAlive, true, 3, 512*1024, 512*1024)
 			if err != nil {
-				c.logger.Errorf("channel dialer: %v", err)
+				c.logger.WithError(err).Error("failed dialing control channel")
+				time.Sleep(c.config.RetryInterval)
+				continue
+			}
+			tcpConn := tunnelTCPConn.(*net.TCPConn)
+			tcpConn.SetLinger(0)
+			tcpConn.SetKeepAlive(true)
+
+			if err := utils.SendBinaryTransportString(tcpConn, c.config.Token, utils.SG_Chan); err != nil {
+				c.logger.WithError(err).Error("failed to send token")
+				tcpConn.Close()
+				continue
+			}
+
+			tcpConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			msg, _, err := utils.ReceiveBinaryTransportString(tcpConn)
+			tcpConn.SetReadDeadline(time.Time{})
+
+			if err != nil {
+				c.logger.WithError(err).Error("control channel read failed")
+				tcpConn.Close()
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
 
-			// Sending security token
-			err = utils.SendBinaryTransportString(tunnelTCPConn, c.config.Token, utils.SG_Chan)
-			if err != nil {
-				c.logger.Errorf("failed to send security token: %v", err)
-				tunnelTCPConn.Close()
-				continue
-			}
-
-			// Set a read deadline for the token response
-			if err := tunnelTCPConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				c.logger.Errorf("failed to set read deadline: %v", err)
-				tunnelTCPConn.Close()
-				continue
-			}
-
-			// Receive response
-			message, _, err := utils.ReceiveBinaryTransportString(tunnelTCPConn)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					c.logger.Warn("timeout while waiting for control channel response")
-				} else {
-					c.logger.Errorf("failed to receive control channel response: %v", err)
-				}
-				tunnelTCPConn.Close() // Close connection on error or timeout
+			if msg != c.config.Token {
+				c.logger.Warnf("unexpected token from server: %s", msg)
+				tcpConn.Close()
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
-			// Resetting the deadline (removes any existing deadline)
-			tunnelTCPConn.SetReadDeadline(time.Time{})
 
-			if message == c.config.Token {
-				c.controlChannel = tunnelTCPConn
-				c.logger.Info("control channel established successfully")
-
-				c.config.TunnelStatus = "Connected (TCP)"
-				go c.poolMaintainer()
-				go c.channelHandler()
-
-				return
-
-			} else {
-				c.logger.Errorf("invalid token received. Expected: %s, Received: %s. Retrying...", c.config.Token, message)
-				tunnelTCPConn.Close() // Close connection if the token is invalid
-				time.Sleep(c.config.RetryInterval)
-				continue
-			}
+			c.controlChannel = tcpConn
+			c.logger.Info("control channel established")
+			c.config.TunnelStatus = "Connected (TCP)"
+			go c.poolMaintainer()
+			go c.channelHandler()
+			return
 		}
 	}
 }
 
 func (c *TcpTransport) poolMaintainer() {
-	for i := 0; i < c.config.ConnPoolSize; i++ { //initial pool filling
-		go c.tunnelDialer()
+	for i := 0; i < c.config.ConnPoolSize; i++ {
+		go func() {
+			time.Sleep(time.Duration(i*20) * time.Millisecond) // stagger
+			c.tunnelDialer()
+		}()
 	}
 
-	// factors
-	a := 4
-	b := 5
-	x := 3
-	y := 4.0
-
+	a, b, x, y := 4, 5, 3, 4.0
 	if c.config.AggressivePool {
+		a, b, x, y = 1, 2, 0, 0.75
 		c.logger.Info("aggressive pool management enabled")
-		a = 1
-		b = 2
-		x = 0
-		y = 0.75
 	}
+	tPool := time.NewTicker(1 * time.Second)
+	tLoad := time.NewTicker(10 * time.Second)
+	defer tPool.Stop()
+	defer tLoad.Stop()
 
-	tickerPool := time.NewTicker(time.Second * 1)
-	defer tickerPool.Stop()
-
-	tickerLoad := time.NewTicker(time.Second * 10)
-	defer tickerLoad.Stop()
-
-	newPoolSize := c.config.ConnPoolSize // intial value
-	var poolConnectionsSum int32 = 0
+	newSize := c.config.ConnPoolSize
+	var sum int32
 
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
+		case <-tPool.C:
+			atomic.AddInt32(&sum, atomic.LoadInt32(&c.poolConnections))
+		case <-tLoad.C:
+			load := (int(atomic.LoadInt32(&c.loadConnections)) + 9) / 10
+			pool := (int(atomic.LoadInt32(&sum)) + 9) / 10
+			atomic.StoreInt32(&sum, 0)
+			atomic.StoreInt32(&c.loadConnections, 0)
 
-		case <-tickerPool.C:
-			// Accumulate pool connections over time (every second)
-			atomic.AddInt32(&poolConnectionsSum, atomic.LoadInt32(&c.poolConnections))
-
-		case <-tickerLoad.C:
-			// Calculate the loadConnections over the last 10 seconds
-			loadConnections := (int(atomic.LoadInt32(&c.loadConnections)) + 9) / 10 // +9 for ceil-like logic
-			atomic.StoreInt32(&c.loadConnections, 0)                                // Reset
-
-			// Calculate the average pool connections over the last 10 seconds
-			poolConnectionsAvg := (int(atomic.LoadInt32(&poolConnectionsSum)) + 9) / 10 // +9 for ceil-like logic
-			atomic.StoreInt32(&poolConnectionsSum, 0)                                   // Reset
-
-			// Dynamically adjust the pool size based on current connections
-			if (loadConnections + a) > poolConnectionsAvg*b {
-				c.logger.Debugf("increasing pool size: %d -> %d, avg pool conn: %d, avg load conn: %d", newPoolSize, newPoolSize+1, poolConnectionsAvg, loadConnections)
-				newPoolSize++
-
-				// Add a new connection to the pool
+			if (load + a) > pool*b {
+				newSize++
 				go c.tunnelDialer()
-			} else if float64(loadConnections+x) < float64(poolConnectionsAvg)*y && newPoolSize > c.config.ConnPoolSize {
-				c.logger.Debugf("decreasing pool size: %d -> %d, avg pool conn: %d, avg load conn: %d", newPoolSize, newPoolSize-1, poolConnectionsAvg, loadConnections)
-				newPoolSize--
-
-				// send a signal to controlFlow
+			} else if float64(load+x) < float64(pool)*y && newSize > c.config.ConnPoolSize {
+				newSize--
 				c.controlFlow <- struct{}{}
 			}
 		}
 	}
+}
 
+func (c *TcpTransport) tunnelDialer() {
+	c.logger.Debugf("initiating new connection to tunnel server at %s", c.config.RemoteAddr)
+	tcpConn, err := TcpDialer(c.ctx, c.config.RemoteAddr, c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, 3, 1024*1024, 1024*1024)
+	if err != nil {
+		c.logger.WithError(err).Error("tunnel server dial error")
+		return
+	}
+	atomic.AddInt32(&c.poolConnections, 1)
+
+	remoteAddr, transport, err := utils.ReceiveBinaryTransportString(tcpConn)
+	atomic.AddInt32(&c.poolConnections, -1)
+	if err != nil {
+		c.logger.WithError(err).Warnf("recv failed from %s", tcpConn.RemoteAddr().String())
+		tcpConn.Close()
+		return
+	}
+
+	if f, ok := tcpConn.(*net.TCPConn); ok {
+		f.SetLinger(0)
+		f.SetKeepAlive(true)
+	}
+
+	port, addr, err := ResolveRemoteAddr(remoteAddr)
+	if err != nil {
+		c.logger.WithError(err).Warn("could not resolve tunnel address")
+		tcpConn.Close()
+		return
+	}
+
+	switch transport {
+	case utils.SG_TCP:
+		c.localDialer(tcpConn, addr, port)
+	case utils.SG_UDP:
+		UDPDialer(tcpConn, addr, c.logger, c.usageMonitor, port, c.config.Sniffer)
+	default:
+		c.logger.Error("invalid transport type")
+		tcpConn.Close()
+	}
+}
+
+func (c *TcpTransport) localDialer(tcpConn net.Conn, addr string, port int) {
+	localConn, err := TcpDialer(c.ctx, addr, c.config.DialTimeOut, c.config.KeepAlive, true, 1, 32*1024, 32*1024)
+	if err != nil {
+		c.logger.WithError(err).Error("local dialer failed")
+		tcpConn.Close()
+		return
+	}
+	c.logger.Debugf("connected to local address %s successfully", addr)
+	utils.TCPConnectionHandler(tcpConn, localConn, c.logger, c.usageMonitor, port, c.config.Sniffer)
 }
 
 func (c *TcpTransport) channelHandler() {
 	msgChan := make(chan byte, 1000)
-
-	// Goroutine to handle the blocking ReceiveBinaryString
 	go func() {
 		for {
 			select {
@@ -257,10 +244,8 @@ func (c *TcpTransport) channelHandler() {
 			default:
 				msg, err := utils.ReceiveBinaryByte(c.controlChannel)
 				if err != nil {
-					if c.cancel != nil {
-						c.logger.Error("failed to read from control channel. ", err)
-						go c.Restart()
-					}
+					c.logger.WithError(err).Error("control channel read failed")
+					go c.Restart()
 					return
 				}
 				msgChan <- msg
@@ -268,112 +253,34 @@ func (c *TcpTransport) channelHandler() {
 		}
 	}()
 
-	// Main loop to listen for context cancellation or received messages
 	for {
 		select {
 		case <-c.ctx.Done():
 			_ = utils.SendBinaryByte(c.controlChannel, utils.SG_Closed)
 			return
-
 		case msg := <-msgChan:
 			switch msg {
 			case utils.SG_Chan:
 				atomic.AddInt32(&c.loadConnections, 1)
-
 				select {
-				case <-c.controlFlow: // Do nothing
-
+				case <-c.controlFlow:
 				default:
 					c.logger.Debug("channel signal received, initiating tunnel dialer")
 					go c.tunnelDialer()
 				}
-
 			case utils.SG_HB:
-				c.logger.Debug("heartbeat signal received successfully")
-
+				c.logger.Debug("heartbeat received")
 			case utils.SG_Closed:
-				c.logger.Warn("control channel has been closed by the server")
+				c.logger.Warn("server closed control channel")
 				go c.Restart()
 				return
-
 			case utils.SG_RTT:
-				err := utils.SendBinaryByte(c.controlChannel, utils.SG_RTT)
-				if err != nil {
-					c.logger.Error("failed to send RTT signal, restarting client: ", err)
-					go c.Restart()
-					return
-				}
-
+				_ = utils.SendBinaryByte(c.controlChannel, utils.SG_RTT)
 			default:
-				c.logger.Errorf("unexpected response from channel: %v.", msg)
+				c.logger.Errorf("unexpected signal byte: %v", msg)
 				go c.Restart()
 				return
 			}
 		}
 	}
-}
-
-// Dialing to the tunnel server, chained functions, without retry
-func (c *TcpTransport) tunnelDialer() {
-	c.logger.Debugf("initiating new connection to tunnel server at %s", c.config.RemoteAddr)
-
-	// Dial to the tunnel server
-	// Based on calculations 1MB of buffer on 80ms RTT will have about 100Mbit Bandwidth per connection,
-	// this is enough to get 800Mbit/s on speedtest and also not having too much buffer to bufferbloat
-	tcpConn, err := TcpDialer(c.ctx, c.config.RemoteAddr, c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, 3, 1024*1024, 1024*1024)
-	if err != nil {
-		c.logger.Error("tunnel server dialer: ", err)
-
-		return
-	}
-
-	// Increment active connections counter
-	atomic.AddInt32(&c.poolConnections, 1)
-
-	// Attempt to receive the remote address from the tunnel server
-	remoteAddr, transport, err := utils.ReceiveBinaryTransportString(tcpConn)
-
-	// Decrement active connections after successful or failed connection
-	atomic.AddInt32(&c.poolConnections, -1)
-
-	if err != nil {
-		c.logger.Debugf("failed to receive port from tunnel connection %s: %v", tcpConn.RemoteAddr().String(), err)
-		tcpConn.Close()
-		return
-	}
-
-	// Extract the port from the received address
-	port, resolvedAddr, err := ResolveRemoteAddr(remoteAddr)
-	if err != nil {
-		c.logger.Infof("failed to resolve remote port: %v", err)
-		tcpConn.Close() // Close the connection on error
-		return
-	}
-
-	switch transport {
-	case utils.SG_TCP:
-		// Dial local server using the received address
-		c.localDialer(tcpConn, resolvedAddr, port)
-
-	case utils.SG_UDP:
-		UDPDialer(tcpConn, resolvedAddr, c.logger, c.usageMonitor, port, c.config.Sniffer)
-
-	default:
-		c.logger.Error("undefined transport. close the connection.")
-		tcpConn.Close()
-	}
-}
-
-func (c *TcpTransport) localDialer(tcpConn net.Conn, remoteAddr string, port int) {
-	// Set Default S,R buffer to 32kb also enabling nodelay on send side of local network ( receive side should be handled by xray)
-	localConnection, err := TcpDialer(c.ctx, remoteAddr, c.config.DialTimeOut, c.config.KeepAlive, true, 1, 32*1024, 32*1024)
-	if err != nil {
-		c.logger.Errorf("local dialer: %v", err)
-		tcpConn.Close()
-		return
-	}
-
-	c.logger.Debugf("connected to local address %s successfully", remoteAddr)
-
-	utils.TCPConnectionHandler(tcpConn, localConnection, c.logger, c.usageMonitor, port, c.config.Sniffer)
 }
