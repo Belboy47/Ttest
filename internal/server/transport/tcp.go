@@ -531,3 +531,48 @@ func (s *TcpTransport) acceptLocalConn(listener net.Listener, remoteAddr string)
 		}
 	}
 }
+func (s *TcpTransport) handleLoop() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.logger.Info("handleLoop context done, exiting")
+			return
+		case conn := <-s.tunnelChannel:
+			// Handle the incoming connection
+			if conn == nil {
+				continue
+			}
+			go s.handleConnection(conn)
+		}
+	}
+}
+
+// handleConnection processes a single TCP tunnel connection.
+func (s *TcpTransport) handleConnection(conn net.Conn) {
+	defer conn.Close()
+
+	// Example: just log remote addr and echo back data (you can customize this)
+	remoteAddr := conn.RemoteAddr().String()
+	s.logger.Infof("Handling new tunnel connection from %s", remoteAddr)
+
+	// Here you would implement your actual proxy/tunnel logic
+	// For example, forwarding data between localChannel and this tunnel connection
+	// This is a placeholder for your actual transport logic.
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			if err != net.ErrClosed {
+				s.logger.Warnf("connection from %s closed or error: %v", remoteAddr, err)
+			}
+			return
+		}
+		// Echo back (remove or replace with actual logic)
+		_, err = conn.Write(buf[:n])
+		if err != nil {
+			s.logger.Warnf("failed to write back to %s: %v", remoteAddr, err)
+			return
+		}
+	}
+}
