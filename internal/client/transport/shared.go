@@ -17,7 +17,7 @@ import (
 	"golang.org/x/exp/rand"
 )
 
-// Seed random once at package init for WebSocket user-agent selection
+// Seed random once at package init for user-agent randomization
 func init() {
 	rand.Seed(uint64(time.Now().UnixNano()))
 }
@@ -45,78 +45,84 @@ func ResolveRemoteAddr(remoteAddr string) (int, string, error) {
 }
 
 // TcpDialer attempts TCP connection with retry and exponential backoff
-func TcpDialer(ctx context.Context, address string, timeout time.Duration, keepAlive time.Duration, nodelay bool, retry int, SO_RCVBUF int, SO_SNDBUF int) (*net.TCPConn, error) {
-	var tcpConn *net.TCPConn
-	var err error
-
-	// Set default buffer sizes if zero
-	if SO_RCVBUF == 0 {
-		SO_RCVBUF = 4 * 1024 * 1024 // 4MB receive buffer
-	}
-	if SO_SNDBUF == 0 {
-		SO_SNDBUF = 4 * 1024 * 1024 // 4MB send buffer
+func TcpDialer(ctx context.Context, address string, timeout, keepAlive time.Duration, nodelay bool, retry, soRcvBuf, soSndBuf int) (*net.TCPConn, error) {
+	if retry < 1 {
+		retry = 1
 	}
 
-	retries := retry
-	backoff := 1 * time.Second
+	backoff := 500 * time.Millisecond
+	var lastErr error
 
-	for i := 0; i < retries; i++ {
-		tcpConn, err = attemptTcpDialer(ctx, address, timeout, keepAlive, nodelay, SO_RCVBUF, SO_SNDBUF)
+	for i := 0; i < retry; i++ {
+		tcpConn, err := attemptTcpDialer(ctx, address, timeout, keepAlive, nodelay, soRcvBuf, soSndBuf)
 		if err == nil {
 			return tcpConn, nil
 		}
 
-		// Log retry attempt
-		fmt.Printf("[TcpDialer] dial to %s failed: %v. Retrying in %v (%d/%d)\n", address, err, backoff, i+1, retries)
+		lastErr = err
 
-		if i == retries-1 {
+		if i == retry-1 {
 			break
 		}
 
+		// Optional: add logging here, e.g.
+		// fmt.Printf("[TcpDialer] attempt %d/%d failed: %v. Retrying in %v\n", i+1, retry, err, backoff)
 		time.Sleep(backoff)
 		backoff *= 2
+		if backoff > 10*time.Second {
+			backoff = 10 * time.Second
+		}
 	}
 
-	return nil, err
+	return nil, lastErr
 }
 
 // attemptTcpDialer performs a single TCP dial attempt with socket options
-func attemptTcpDialer(ctx context.Context, address string, timeout time.Duration, keepAlive time.Duration, nodelay bool, SO_RCVBUF int, SO_SNDBUF int) (*net.TCPConn, error) {
+func attemptTcpDialer(ctx context.Context, address string, timeout, keepAlive time.Duration, nodelay bool, soRcvBuf, soSndBuf int) (*net.TCPConn, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("DNS resolution: %v", err)
 	}
 
+	if soRcvBuf == 0 {
+		soRcvBuf = 4 * 1024 * 1024 // 4MB default
+	}
+	if soSndBuf == 0 {
+		soSndBuf = 4 * 1024 * 1024
+	}
+
 	dialer := &net.Dialer{
-		Control: func(network, address string, s syscall.RawConn) error {
-			err := ReusePortControl(network, address, s)
-			if err != nil {
-				return err
-			}
-
-			if SO_RCVBUF > 0 {
-				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, SO_RCVBUF); err != nil {
-						err = fmt.Errorf("failed to set SO_RCVBUF: %v", err)
-					}
-				})
-			}
-			if err != nil {
-				return err
-			}
-
-			if SO_SNDBUF > 0 {
-				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, SO_SNDBUF); err != nil {
-						err = fmt.Errorf("failed to set SO_SNDBUF: %v", err)
-					}
-				})
-			}
-
-			return err
-		},
 		Timeout:   timeout,
 		KeepAlive: keepAlive,
+		Control: func(network, address string, s syscall.RawConn) error {
+			var controlErr error
+
+			if err := ReusePortControl(network, address, s); err != nil {
+				return err
+			}
+
+			if soRcvBuf > 0 {
+				if err := s.Control(func(fd uintptr) {
+					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, soRcvBuf); err != nil {
+						controlErr = fmt.Errorf("failed to set SO_RCVBUF: %v", err)
+					}
+				}); err != nil {
+					return err
+				}
+			}
+
+			if soSndBuf > 0 {
+				if err := s.Control(func(fd uintptr) {
+					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, soSndBuf); err != nil {
+						controlErr = fmt.Errorf("failed to set SO_SNDBUF: %v", err)
+					}
+				}); err != nil {
+					return err
+				}
+			}
+
+			return controlErr
+		},
 	}
 
 	conn, err := dialer.DialContext(ctx, "tcp", tcpAddr.String())
@@ -130,15 +136,10 @@ func attemptTcpDialer(ctx context.Context, address string, timeout time.Duration
 		return nil, fmt.Errorf("failed to convert net.Conn to *net.TCPConn")
 	}
 
-	// Enable TCP_NODELAY by default unless explicitly disabled
-	if nodelay {
-		err = tcpConn.SetNoDelay(true)
-	} else {
-		err = tcpConn.SetNoDelay(false)
-	}
-	if err != nil {
+	// Enable TCP_NODELAY based on nodelay flag
+	if err := tcpConn.SetNoDelay(nodelay); err != nil {
 		tcpConn.Close()
-		return nil, fmt.Errorf("failed to set TCP_NODELAY")
+		return nil, fmt.Errorf("failed to set TCP_NODELAY: %v", err)
 	}
 
 	return tcpConn, nil
@@ -155,8 +156,8 @@ func ReusePortControl(network, address string, s syscall.RawConn) error {
 		}
 
 		if runtime.GOOS == "linux" {
-			// SO_REUSEPORT is 0xf on Linux
-			if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0xf, 1); err != nil {
+			const SO_REUSEPORT = 0xf
+			if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEPORT, 1); err != nil {
 				controlErr = fmt.Errorf("failed to set SO_REUSEPORT: %v", err)
 				return
 			}
@@ -166,47 +167,42 @@ func ReusePortControl(network, address string, s syscall.RawConn) error {
 	if err != nil {
 		return err
 	}
-
 	return controlErr
 }
 
-// WebSocketDialer attempts to establish a WebSocket connection with retries and backoff
-func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
-	var tunnelWSConn *websocket.Conn
-	var err error
-
-	// Set default buffer sizes if zero
-	if SO_RCVBUF == 0 {
-		SO_RCVBUF = 4 * 1024 * 1024
-	}
-	if SO_SNDBUF == 0 {
-		SO_SNDBUF = 4 * 1024 * 1024
+// WebSocketDialer attempts WebSocket connection with retries and exponential backoff
+func WebSocketDialer(ctx context.Context, addr, edgeIP, path string, timeout, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, retry, soRcvBuf, soSndBuf int) (*websocket.Conn, error) {
+	if retry < 1 {
+		retry = 1
 	}
 
-	retries := retry
-	backoff := 1 * time.Second
+	backoff := 500 * time.Millisecond
+	var lastErr error
 
-	for i := 0; i < retries; i++ {
-		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, path, timeout, keepalive, nodelay, token, mode, SO_RCVBUF, SO_SNDBUF)
+	for i := 0; i < retry; i++ {
+		conn, err := attemptDialWebSocket(ctx, addr, edgeIP, path, timeout, keepalive, nodelay, token, mode, soRcvBuf, soSndBuf)
 		if err == nil {
-			return tunnelWSConn, nil
+			return conn, nil
 		}
 
-		fmt.Printf("[WebSocketDialer] dial to %s failed: %v. Retrying in %v (%d/%d)\n", addr, err, backoff, i+1, retries)
+		lastErr = err
 
-		if i == retries-1 {
+		if i == retry-1 {
 			break
 		}
 
+		// Optional: log retry
 		time.Sleep(backoff)
 		backoff *= 2
+		if backoff > 10*time.Second {
+			backoff = 10 * time.Second
+		}
 	}
 
-	return nil, err
+	return nil, lastErr
 }
 
-// attemptDialWebSocket makes one WebSocket dial attempt
-func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
+func attemptDialWebSocket(ctx context.Context, addr, edgeIP, path string, timeout, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, soRcvBuf, soSndBuf int) (*websocket.Conn, error) {
 	randomUserID := rand.Int31()
 
 	userAgents := []string{
@@ -237,5 +233,67 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		// Opera
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 OPR/97.0.4719.63",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 OPR/98.0.4759.15",
-		"Mozilla/5.0 (Linux; Android 10; SM-N975F) AppleWebKit/537.36
+		"Mozilla/5.0 (Linux; Android 10; SM-N975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Mobile Safari/537.36 OPR/65.2.3381.61420",
+		"Mozilla/5.0 (Linux; Android 11; SM-G998U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.196 Mobile Safari/537.36 OPR/71.2.3767.68577",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36 OPR/99.0.4759.21",
+		// Older Browsers
+		"Mozilla/4.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
+		"Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1)",
+		"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36",
 	}
+
+	randomUserAgent := userAgents[rand.Intn(len(userAgents))]
+
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+token)
+	headers.Set("X-User-Id", strconv.Itoa(int(randomUserID)))
+	headers.Set("User-Agent", randomUserAgent)
+
+	if edgeIP != "" {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid addr format: %w", err)
+		}
+		edgeIP = net.JoinHostPort(edgeIP, port)
+	} else {
+		edgeIP = addr
+	}
+
+	if path != "/channel" {
+		path = path + "/" + strconv.Itoa(int(randomUserID))
+	}
+
+	var wsURL string
+	netDialFunc := func(_, address string) (net.Conn, error) {
+		return TcpDialer(ctx, edgeIP, timeout, keepalive, nodelay, 1, soRcvBuf, soSndBuf)
+	}
+
+	switch mode {
+	case config.WS, config.WSMUX:
+		wsURL = "ws://" + addr + path
+	case config.WSS, config.WSSMUX:
+		wsURL = "wss://" + addr + path
+	default:
+		return nil, fmt.Errorf("unsupported transport mode: %v", mode)
+	}
+
+	dialer := websocket.Dialer{
+		EnableCompression: true,
+		HandshakeTimeout:  45 * time.Second,
+		NetDial:           netDialFunc,
+	}
+
+	if mode == config.WSS || mode == config.WSSMUX {
+		dialer.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
+	conn, _, err := dialer.Dial(wsURL, headers)
+	if err != nil {
+		return nil, fmt.Errorf("websocket dial error: %w", err)
+	}
+
+	return conn, nil
+}
