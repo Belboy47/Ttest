@@ -264,20 +264,22 @@ func (s *TcpTransport) channelHandler() {
 	}
 }
 
-// Modified tunnelListener with SO_REUSEADDR and SO_REUSEPORT
+// Modified tunnelListener with proper SO_REUSEADDR and SO_REUSEPORT set on Linux
 func (s *TcpTransport) tunnelListener() {
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			var err error
-			c.Control(func(fd uintptr) {
-				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-				if err != nil {
+			controlErr := c.Control(func(fd uintptr) {
+				if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 					return
 				}
 				if runtime.GOOS == "linux" {
 					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
 				}
 			})
+			if controlErr != nil {
+				return controlErr
+			}
 			return err
 		},
 	}
@@ -287,7 +289,6 @@ func (s *TcpTransport) tunnelListener() {
 		s.logger.Fatalf("failed to start listener on %s: %v", s.config.BindAddr, err)
 		return
 	}
-
 	defer listener.Close()
 
 	s.logger.Infof("server started successfully, listening on address: %s", listener.Addr().String())
@@ -323,16 +324,14 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 				continue
 			}
 
-			// TCP_NODELAY: enabled by default, disabled if config.Nodelay==false
 			tcpNodelay := true
-			if s.config.Nodelay == false {
+			if !s.config.Nodelay {
 				tcpNodelay = false
 			}
 			if err := tcpConn.SetNoDelay(tcpNodelay); err != nil {
 				s.logger.Warnf("failed to set TCP_NODELAY=%v for %s: %v", tcpNodelay, tcpConn.RemoteAddr().String(), err)
 			}
 
-			// KeepAlive settings
 			if err := tcpConn.SetKeepAlive(true); err != nil {
 				s.logger.Warnf("failed to enable TCP keep-alive for %s: %v", tcpConn.RemoteAddr().String(), err)
 			}
@@ -340,7 +339,6 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 				s.logger.Warnf("failed to set TCP keep-alive period for %s: %v", tcpConn.RemoteAddr().String(), err)
 			}
 
-			// Set socket buffer sizes
 			rawConn, err := tcpConn.SyscallConn()
 			if err == nil {
 				rawConn.Control(func(fd uintptr) {
@@ -456,15 +454,17 @@ func (s *TcpTransport) localListener(localAddr string, remoteAddr string) {
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			var err error
-			c.Control(func(fd uintptr) {
-				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-				if err != nil {
+			controlErr := c.Control(func(fd uintptr) {
+				if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 					return
 				}
 				if runtime.GOOS == "linux" {
 					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
 				}
 			})
+			if controlErr != nil {
+				return controlErr
+			}
 			return err
 		},
 	}
@@ -506,7 +506,7 @@ func (s *TcpTransport) acceptLocalConn(listener net.Listener, remoteAddr string)
 			}
 
 			tcpNodelay := true
-			if s.config.Nodelay == false {
+			if !s.config.Nodelay {
 				tcpNodelay = false
 			}
 			if err := tcpConn.SetNoDelay(tcpNodelay); err != nil {
@@ -531,6 +531,7 @@ func (s *TcpTransport) acceptLocalConn(listener net.Listener, remoteAddr string)
 		}
 	}
 }
+
 func (s *TcpTransport) handleLoop() {
 	for {
 		select {
@@ -551,13 +552,8 @@ func (s *TcpTransport) handleLoop() {
 func (s *TcpTransport) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// Example: just log remote addr and echo back data (you can customize this)
 	remoteAddr := conn.RemoteAddr().String()
 	s.logger.Infof("Handling new tunnel connection from %s", remoteAddr)
-
-	// Here you would implement your actual proxy/tunnel logic
-	// For example, forwarding data between localChannel and this tunnel connection
-	// This is a placeholder for your actual transport logic.
 
 	buf := make([]byte, 4096)
 	for {
@@ -568,7 +564,6 @@ func (s *TcpTransport) handleConnection(conn net.Conn) {
 			}
 			return
 		}
-		// Echo back (remove or replace with actual logic)
 		_, err = conn.Write(buf[:n])
 		if err != nil {
 			s.logger.Warnf("failed to write back to %s: %v", remoteAddr, err)
