@@ -95,13 +95,14 @@ func (c *TcpTransport) channelDialer() {
 		case <-c.ctx.Done():
 			return
 		default:
-			tunnelTCPConn, err := TcpDialer(c.ctx, c.config.RemoteAddr, c.config.DialTimeOut, c.config.KeepAlive, true, 3, 512*1024, 512*1024)
+			tcpConn, err := TcpDialer(c.ctx, c.config.RemoteAddr, c.config.DialTimeOut, c.config.KeepAlive, true, 3, 512*1024, 512*1024)
 			if err != nil {
 				c.logger.WithError(err).Error("failed dialing control channel")
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
-			tcpConn := tunnelTCPConn.(*net.TCPConn)
+
+			// tcpConn is already *net.TCPConn, no assertion needed
 			tcpConn.SetLinger(0)
 			tcpConn.SetKeepAlive(true)
 
@@ -141,10 +142,10 @@ func (c *TcpTransport) channelDialer() {
 
 func (c *TcpTransport) poolMaintainer() {
 	for i := 0; i < c.config.ConnPoolSize; i++ {
-		go func() {
-			time.Sleep(time.Duration(i*20) * time.Millisecond) // stagger
+		go func(idx int) {
+			time.Sleep(time.Duration(idx*20) * time.Millisecond) // stagger start
 			c.tunnelDialer()
-		}()
+		}(i)
 	}
 
 	a, b, x, y := 4, 5, 3, 4.0
@@ -152,6 +153,7 @@ func (c *TcpTransport) poolMaintainer() {
 		a, b, x, y = 1, 2, 0, 0.75
 		c.logger.Info("aggressive pool management enabled")
 	}
+
 	tPool := time.NewTicker(1 * time.Second)
 	tLoad := time.NewTicker(10 * time.Second)
 	defer tPool.Stop()
@@ -172,7 +174,7 @@ func (c *TcpTransport) poolMaintainer() {
 			atomic.StoreInt32(&sum, 0)
 			atomic.StoreInt32(&c.loadConnections, 0)
 
-			if (load + a) > pool*b {
+			if (load+a) > pool*b {
 				newSize++
 				go c.tunnelDialer()
 			} else if float64(load+x) < float64(pool)*y && newSize > c.config.ConnPoolSize {
@@ -200,10 +202,9 @@ func (c *TcpTransport) tunnelDialer() {
 		return
 	}
 
-	if f, ok := tcpConn.(*net.TCPConn); ok {
-		f.SetLinger(0)
-		f.SetKeepAlive(true)
-	}
+	// tcpConn is already *net.TCPConn, no assertion needed
+	tcpConn.SetLinger(0)
+	tcpConn.SetKeepAlive(true)
 
 	port, addr, err := ResolveRemoteAddr(remoteAddr)
 	if err != nil {
