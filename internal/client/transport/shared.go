@@ -238,3 +238,4 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 OPR/97.0.4719.63",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 OPR/98.0.4759.15",
 		"Mozilla/5.0 (Linux; Android 10; SM-N975F) AppleWebKit/537.36
+	}
