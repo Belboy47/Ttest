@@ -41,7 +41,7 @@ type TcpConfig struct {
 	Nodelay      bool          // true = enable TCP_NODELAY, false = disable
 	Sniffer      bool
 	KeepAlive    time.Duration // e.g. 30s or 1m
-	Heartbeat    time.Duration // in seconds
+	Heartbeat    time.Duration // e.g. 5s
 	ChannelSize  int
 	WebPort      int
 	AcceptUDP    bool
@@ -155,7 +155,8 @@ func (s *TcpTransport) channelHandshake() {
 				s.logger.Errorf("invalid signal received for channel, discarding connection")
 				conn.Close()
 				continue
-			} else if err != nil {
+			}
+			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					s.logger.Warn("timeout while waiting for control channel signal")
 				} else {
@@ -165,7 +166,7 @@ func (s *TcpTransport) channelHandshake() {
 				continue
 			}
 
-			conn.SetReadDeadline(time.Time{})
+			_ = conn.SetReadDeadline(time.Time{}) // clear deadline
 
 			if msg != s.config.Token {
 				s.logger.Warnf("invalid security token received: %s", msg)
@@ -181,7 +182,6 @@ func (s *TcpTransport) channelHandshake() {
 			}
 
 			s.controlChannel = conn
-
 			s.logger.Info("control channel successfully established.")
 			return
 		}
@@ -203,7 +203,7 @@ func (s *TcpTransport) channelHandler() {
 				message, err := utils.ReceiveBinaryByte(s.controlChannel)
 				if err != nil {
 					if s.cancel != nil {
-						s.logger.Error("failed to read from channel connection. ", err)
+						s.logger.Error("failed to read from channel connection: ", err)
 						go s.Restart()
 					}
 					return
@@ -213,7 +213,7 @@ func (s *TcpTransport) channelHandler() {
 		}
 	}()
 
-	rtt := time.Now()
+	rttSentAt := time.Now()
 	err := utils.SendBinaryByte(s.controlChannel, utils.SG_RTT)
 	if err != nil {
 		s.logger.Error("failed to send RTT signal, attempting to restart server...")
@@ -230,7 +230,7 @@ func (s *TcpTransport) channelHandler() {
 		case <-s.reqNewConnChan:
 			err := utils.SendBinaryByte(s.controlChannel, utils.SG_Chan)
 			if err != nil {
-				s.logger.Error("failed to send request new connection signal. ", err)
+				s.logger.Error("failed to send request new connection signal: ", err)
 				go s.Restart()
 				return
 			}
@@ -250,21 +250,23 @@ func (s *TcpTransport) channelHandler() {
 				return
 			}
 
-			if message == utils.SG_Closed {
+			switch message {
+			case utils.SG_Closed:
 				s.logger.Warn("control channel has been closed by the client")
 				go s.Restart()
 				return
 
-			} else if message == utils.SG_RTT {
-				measureRTT := time.Since(rtt)
+			case utils.SG_RTT:
+				measureRTT := time.Since(rttSentAt)
 				s.rtt = measureRTT.Milliseconds()
 				s.logger.Infof("Round Trip Time (RTT): %d ms", s.rtt)
+				// Reset RTT measurement start time
+				rttSentAt = time.Now()
 			}
 		}
 	}
 }
 
-// Modified tunnelListener with proper SO_REUSEADDR and SO_REUSEPORT set on Linux
 func (s *TcpTransport) tunnelListener() {
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -318,16 +320,18 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 				continue
 			}
 
-			if s.controlChannel != nil && s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String() != tcpConn.RemoteAddr().(*net.TCPAddr).IP.String() {
-				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", tcpConn.RemoteAddr().(*net.TCPAddr).IP.String(), s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String())
-				tcpConn.Close()
-				continue
+			// Only accept connections from the same IP as controlChannel
+			if s.controlChannel != nil {
+				controlIP := s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String()
+				connIP := tcpConn.RemoteAddr().(*net.TCPAddr).IP.String()
+				if controlIP != connIP {
+					s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", connIP, controlIP)
+					tcpConn.Close()
+					continue
+				}
 			}
 
-			tcpNodelay := true
-			if !s.config.Nodelay {
-				tcpNodelay = false
-			}
+			tcpNodelay := s.config.Nodelay
 			if err := tcpConn.SetNoDelay(tcpNodelay); err != nil {
 				s.logger.Warnf("failed to set TCP_NODELAY=%v for %s: %v", tcpNodelay, tcpConn.RemoteAddr().String(), err)
 			}
@@ -342,18 +346,18 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 			rawConn, err := tcpConn.SyscallConn()
 			if err == nil {
 				rawConn.Control(func(fd uintptr) {
-					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, defaultSockBufSize)
-					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, defaultSockBufSize)
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, defaultSockBufSize)
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, defaultSockBufSize)
 				})
 			} else {
 				s.logger.Warnf("failed to get raw connection for socket options: %v", err)
 			}
 
 			select {
-			case s.tunnelChannel <- conn:
+			case s.tunnelChannel <- tcpConn:
 			default:
-				s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
-				conn.Close()
+				s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", tcpConn.LocalAddr().String())
+				tcpConn.Close()
 			}
 		}
 	}
@@ -505,17 +509,21 @@ func (s *TcpTransport) acceptLocalConn(listener net.Listener, remoteAddr string)
 				continue
 			}
 
-			tcpNodelay := true
-			if !s.config.Nodelay {
-				tcpNodelay = false
-			}
+			tcpNodelay := s.config.Nodelay
 			if err := tcpConn.SetNoDelay(tcpNodelay); err != nil {
 				s.logger.Warnf("failed to set TCP_NODELAY=%v for %s: %v", tcpNodelay, tcpConn.RemoteAddr().String(), err)
 			}
 
+			// Optional: add keepalive for local connections as well if desired
+			if err := tcpConn.SetKeepAlive(true); err != nil {
+				s.logger.Warnf("failed to enable TCP keep-alive for %s: %v", tcpConn.RemoteAddr().String(), err)
+			}
+			if err := tcpConn.SetKeepAlivePeriod(s.config.KeepAlive); err != nil {
+				s.logger.Warnf("failed to set TCP keep-alive period for %s: %v", tcpConn.RemoteAddr().String(), err)
+			}
+
 			select {
 			case s.localChannel <- LocalTCPConn{conn: conn, remoteAddr: remoteAddr, timeCreated: time.Now().UnixMilli()}:
-
 				select {
 				case s.reqNewConnChan <- struct{}{}:
 				default:
@@ -539,7 +547,6 @@ func (s *TcpTransport) handleLoop() {
 			s.logger.Info("handleLoop context done, exiting")
 			return
 		case conn := <-s.tunnelChannel:
-			// Handle the incoming connection
 			if conn == nil {
 				continue
 			}
