@@ -10,7 +10,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
+  
+	"golang.org/x/sys/unix"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/web"
 
@@ -276,7 +277,7 @@ func (s *TcpTransport) tunnelListener() {
 					return
 				}
 				if runtime.GOOS == "linux" {
-					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 				}
 			})
 			if controlErr != nil {
@@ -463,7 +464,7 @@ func (s *TcpTransport) localListener(localAddr string, remoteAddr string) {
 					return
 				}
 				if runtime.GOOS == "linux" {
-					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+					err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 				}
 			})
 			if controlErr != nil {
